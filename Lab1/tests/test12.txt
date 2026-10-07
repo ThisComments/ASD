@@ -1,0 +1,7 @@
+abcdef
+fed
+abc
+bed
+cab
+def
+a

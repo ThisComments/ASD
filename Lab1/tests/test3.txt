@@ -1,0 +1,6 @@
+abcdef
+abc
+def
+ace
+fed
+a
