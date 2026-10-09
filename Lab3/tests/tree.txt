@@ -1,0 +1,14 @@
+a a
+.b o
+..e l
+..f o
+...n l
+...o l
+..g a
+...p l
+...r l
+.c l
+.d o
+..h l
+..k l
+..l l
