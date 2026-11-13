@@ -1,20 +1,13 @@
 #include <algorithm>
+#include <charconv>
 #include <fstream>
 #include <iostream>
 #include <map>
-#include <set>
+#include <queue>
 #include <string>
 #include <vector>
-#include <charconv>
 
-/* 
-Общими требованиями к лабораторной работе являются:
-   1) вводить  граф из файла в понятной для пользователя форме
-(не в виде матрицы смежности, без дублирования информации и т.
-п.);
-   2) обеспечить   возможность   многократных   запросов   без
-повторного запуска программы там, где это требуется.
-
+/*
 28. На диске имеется база  данных  по  физическим  эффектам
 (ФЭ).  Каждый  ФЭ  записан в виде тройки компонент:  название,
 входная  физическая  величина  (вход),   выходная   физическая
@@ -22,27 +15,13 @@
 величин. Требуется построить в основной памяти граф связи ФЭ и
 обеспечить  поиск  цепочек  ФЭ от одного до четырех звеньев по
 заданным входу и выходу по возрастанию количества звеньев (12).
-
-
-
-разобраться с поиском в глубину
-
-граф по велечинам строить
 */
 
 const std::string QUANTITIES_FILE_NAME = "P_NAME.TXT";
 const std::string EFFECTS_FILE_NAME = "PHYS.TXT";
 const std::string RESULT_FILE_NAME = "RESULT.TXT";
-const std::string ARROW = " \xE2\x86\x92 ";
-const std::string LIST_SEPARATOR = ", ";
-const std::string WHITESPACE = " \t\r\n";
-const char QUANTITY_DELIMITER = ':';
-const char EFFECT_DELIMITER = ';';
-const char INPUT_DELIMITER = ',';
 const int MAX_QUANTITY_ID = 100;
-const size_t MIN_PATH_LENGTH = 1;
-const size_t MAX_PATH_LENGTH = 4;
-const size_t SINGLE_INPUT_COUNT = 1;
+const size_t MAX_CHAIN_LENGTH = 4;
 
 struct PhysicalEffect
 {
@@ -51,36 +30,45 @@ struct PhysicalEffect
 	int outputId;
 };
 
-struct Graph
+struct QuantityEdge
 {
-	std::map<int, std::string> quantityNames;
-	std::vector<PhysicalEffect> effects;
-	std::map<int, std::vector<size_t>> effectsByInput;
+	int targetQuantityId;
+	std::vector<size_t> effectIndices;
 };
 
-std::string Trim(
-	const std::string& text
-)
+struct QuantityNode
 {
-	size_t first = text.find_first_not_of(WHITESPACE);
+	int id;
+	std::string name;
+	std::vector<QuantityEdge> outgoingEdges;
+};
+
+struct Graph
+{
+	std::map<int, QuantityNode> nodes;
+	std::vector<PhysicalEffect> effects;
+};
+
+using QuantityPath = std::vector<int>;
+
+std::string Trim(const std::string& text)
+{
+	size_t first = text.find_first_not_of(" \t\r\n");
 	if (first == std::string::npos)
 	{
 		return "";
 	}
-	size_t last = text.find_last_not_of(WHITESPACE);
+	size_t last = text.find_last_not_of(" \t\r\n");
 	return text.substr(first, last - first + 1);
 }
 
-std::vector<std::string> Split(
-	const std::string& text, 
-	char delimiter
-)
+std::vector<std::string> Split(const std::string& text)
 {
 	std::vector<std::string> parts;
 	size_t start = 0;
 	while (true)
 	{
-		size_t position = text.find(delimiter, start);
+		size_t position = text.find(',', start);
 		if (position == std::string::npos)
 		{
 			parts.push_back(Trim(text.substr(start)));
@@ -92,8 +80,22 @@ std::vector<std::string> Split(
 	return parts;
 }
 
+std::string JoinStrings(const std::vector<std::string>& items)
+{
+	std::string result;
+	for (size_t i = 0; i < items.size(); ++i)
+	{
+		if (i > 0)
+		{
+			result += ", ";
+		}
+		result += items[i];
+	}
+	return result;
+}
+
 bool ParseInteger(
-	const std::string& text, 
+	const std::string& text,
 	int& value
 )
 {
@@ -101,23 +103,21 @@ bool ParseInteger(
 	{
 		return false;
 	}
-
 	auto result = std::from_chars(text.data(), text.data() + text.size(), value);
-
 	return result.ec == std::errc() && result.ptr == text.data() + text.size();
 }
 
 bool IsValidQuantityId(
-	const Graph& graph, 
+	const Graph& graph,
 	int id
 )
 {
-	return graph.quantityNames.count(id) > 0;
+	return graph.nodes.find(id) != graph.nodes.end();
 }
 
 void ReportBadLine(
-	const std::string& fileName, 
-	size_t lineNumber, 
+	const std::string& fileName,
+	size_t lineNumber,
 	const std::string& reason
 )
 {
@@ -125,12 +125,12 @@ void ReportBadLine(
 }
 
 bool LoadQuantities(
-	const std::string& fileName, 
+	const std::string& fileName,
 	Graph& graph
 )
 {
 	std::ifstream file(fileName);
-	if (!file)
+	if (!file.is_open())
 	{
 		std::cerr << "Ошибка: невозможно открыть файл " << fileName << std::endl;
 		return false;
@@ -147,33 +147,39 @@ bool LoadQuantities(
 			continue;
 		}
 
-		size_t position = line.find(QUANTITY_DELIMITER);
+		size_t position = line.find(':');
 		int id = 0;
 		if (position == std::string::npos || !ParseInteger(Trim(line.substr(0, position)), id))
 		{
-			ReportBadLine(fileName, lineNumber, "ожидаемый формат: идентификатор:имя");
+			ReportBadLine(fileName, lineNumber, "ожидаемый формат: id:название");
 			continue;
 		}
+
 		std::string name = Trim(line.substr(position + 1));
 		if (id < 1 || id > MAX_QUANTITY_ID)
 		{
-			ReportBadLine(fileName, lineNumber, "идентификатор вне допустимого диапазона");
+			std::string reportLine = "id вне допустимого диапазона (1.." + MAX_QUANTITY_ID + ')';
+			ReportBadLine(fileName, lineNumber, reportLine);
 			continue;
 		}
 		if (name.empty())
 		{
-			ReportBadLine(fileName, lineNumber, "пустое имя физической величины");
+			ReportBadLine(fileName, lineNumber, "пустое название физической величины");
 			continue;
 		}
 		if (IsValidQuantityId(graph, id))
 		{
-			ReportBadLine(fileName, lineNumber, "дубликат идентификатора");
+			ReportBadLine(fileName, lineNumber, "дубликат id физической величины");
 			continue;
 		}
-		graph.quantityNames[id] = name;
+
+		QuantityNode node;
+		node.id = id;
+		node.name = name;
+		graph.nodes[id] = node;
 	}
 
-	if (graph.quantityNames.empty())
+	if (graph.nodes.empty())
 	{
 		std::cerr << "Ошибка: не загружены физические величины из " << fileName << std::endl;
 		return false;
@@ -181,45 +187,104 @@ bool LoadQuantities(
 	return true;
 }
 
-void AddEffect(
-	Graph& graph, 
+QuantityEdge* FindOutgoingEdge(
+	QuantityNode& node,
+	int targetId
+)
+{
+	for (QuantityEdge& edge : node.outgoingEdges)
+	{
+		if (edge.targetQuantityId == targetId)
+		{
+			return &edge;
+		}
+	}
+	return nullptr;
+}
+
+const QuantityEdge* FindOutgoingEdge(
+	const QuantityNode& node,
+	int targetId
+)
+{
+	for (const QuantityEdge& edge : node.outgoingEdges)
+	{
+		if (edge.targetQuantityId == targetId)
+		{
+			return &edge;
+		}
+	}
+	return nullptr;
+}
+
+void LinkEffectToEdge(
+	Graph& graph,
+	int inputId,
+	int outputId,
+	size_t effectIndex
+)
+{
+	QuantityNode& sourceNode = graph.nodes[inputId];
+	QuantityEdge* existingEdge = FindOutgoingEdge(sourceNode, outputId);
+
+	if (existingEdge != nullptr)
+	{
+		if (std::find(existingEdge->effectIndices.begin(), existingEdge->effectIndices.end(), effectIndex) == existingEdge->effectIndices.end())
+		{
+			existingEdge->effectIndices.push_back(effectIndex);
+		}
+	}
+	else
+	{
+		QuantityEdge newEdge;
+		newEdge.targetQuantityId = outputId;
+		newEdge.effectIndices.push_back(effectIndex);
+		sourceNode.outgoingEdges.push_back(newEdge);
+	}
+}
+
+void AddEffectToGraph(
+	Graph& graph,
 	const PhysicalEffect& effect
 )
 {
 	for (const PhysicalEffect& existing : graph.effects)
 	{
-		if (existing.name == effect.name && existing.outputId == effect.outputId
+		if (existing.name == effect.name
+			&& existing.outputId == effect.outputId
 			&& existing.inputIds == effect.inputIds)
 		{
 			return;
 		}
 	}
+
 	size_t effectIndex = graph.effects.size();
 	graph.effects.push_back(effect);
+
 	for (int inputId : effect.inputIds)
 	{
-		graph.effectsByInput[inputId].push_back(effectIndex);
+		LinkEffectToEdge(graph, inputId, effect.outputId, effectIndex);
 	}
 }
 
 bool SplitEffectLine(
-	const std::string& line, 
-	std::string& name, 
-	std::string& inputs, 
+	const std::string& line,
+	std::string& name,
+	std::string& inputs,
 	std::string& output
 )
 {
-	size_t firstPosition = line.find(EFFECT_DELIMITER);
+	size_t firstPosition = line.find(';');
 	if (firstPosition == std::string::npos)
 	{
 		return false;
 	}
-	size_t secondPosition = line.find(EFFECT_DELIMITER, firstPosition + 1);
+	size_t secondPosition = line.find(';', firstPosition + 1);
 	if (secondPosition == std::string::npos)
 	{
 		return false;
 	}
-	size_t thirdPosition = line.find(EFFECT_DELIMITER, secondPosition + 1);
+	size_t thirdPosition = line.find(';', secondPosition + 1);
 
 	name = Trim(line.substr(0, firstPosition));
 	inputs = Trim(line.substr(firstPosition + 1, secondPosition - firstPosition - 1));
@@ -233,13 +298,13 @@ bool SplitEffectLine(
 }
 
 bool ParseInputIds(
-	const Graph& graph, 
-	const std::string& inputsText, 
-	std::vector<int>& inputIds, 
+	const Graph& graph,
+	const std::string& inputsText,
+	std::vector<int>& inputIds,
 	std::string& error
 )
 {
-	for (const std::string& inputText : Split(inputsText, INPUT_DELIMITER))
+	for (const std::string& inputText : Split(inputsText))
 	{
 		int inputId = 0;
 		if (!ParseInteger(inputText, inputId) || !IsValidQuantityId(graph, inputId))
@@ -252,16 +317,16 @@ bool ParseInputIds(
 			inputIds.push_back(inputId);
 		}
 	}
-	return true;
+	return !inputIds.empty();
 }
 
 bool LoadEffects(
-	const std::string& fileName, 
+	const std::string& fileName,
 	Graph& graph
 )
 {
 	std::ifstream file(fileName);
-	if (!file)
+	if (!file.is_open())
 	{
 		std::cerr << "Ошибка: невозможно открыть файл " << fileName << std::endl;
 		return false;
@@ -279,27 +344,31 @@ bool LoadEffects(
 		}
 
 		PhysicalEffect effect;
-		std::string inputs;
-		std::string output;
-		if (!SplitEffectLine(line, effect.name, inputs, output) || effect.name.empty()
-			|| !ParseInteger(output, effect.outputId))
+		std::string inputsText;
+		std::string outputText;
+
+		if (!SplitEffectLine(line, effect.name, inputsText, outputText)
+			|| effect.name.empty()
+			|| !ParseInteger(outputText, effect.outputId))
 		{
-			ReportBadLine(fileName, lineNumber, "ожидаемый формат имя;входы;выходы;");
+			ReportBadLine(fileName, lineNumber, "ожидаемый формат: название ФЭ;id_входов;id_выхода");
 			continue;
 		}
+
 		if (!IsValidQuantityId(graph, effect.outputId))
 		{
-			ReportBadLine(fileName, lineNumber, "неизвестная выходная величина " + output);
+			ReportBadLine(fileName, lineNumber, "неизвестная выходная величина " + outputText);
 			continue;
 		}
 
 		std::string error;
-		if (!ParseInputIds(graph, inputs, effect.inputIds, error))
+		if (!ParseInputIds(graph, inputsText, effect.inputIds, error))
 		{
 			ReportBadLine(fileName, lineNumber, error);
 			continue;
 		}
-		AddEffect(graph, effect);
+
+		AddEffectToGraph(graph, effect);
 	}
 
 	if (graph.effects.empty())
@@ -310,121 +379,61 @@ bool LoadEffects(
 	return true;
 }
 
-std::set<int> GetNextQuantities(
-	const Graph& graph, 
-	int current
-)
+bool IsQuantityInPath(const QuantityPath& path, int quantityId)
 {
-	std::set<int> nextQuantities;
-	auto effectsIterator = graph.effectsByInput.find(current);
-	if (effectsIterator != graph.effectsByInput.end())
-	{
-		for (size_t effectIndex : effectsIterator->second)
-		{
-			nextQuantities.insert(graph.effects[effectIndex].outputId);
-		}
-	}
-	return nextQuantities;
+	return std::find(path.begin(), path.end(), quantityId) != path.end();
 }
 
-std::vector<size_t> FindEdgeEffects(
-	const Graph& graph, 
-	int fromId, 
-	int toId
+std::vector<QuantityPath> AdvanceBfsOneLevel(
+	const Graph& graph,
+	int targetId,
+	std::queue<QuantityPath>& pathQueue
 )
 {
-	std::vector<size_t> edgeEffects;
-	auto effectsIterator = graph.effectsByInput.find(fromId);
-	if (effectsIterator == graph.effectsByInput.end())
+	std::vector<QuantityPath> foundOnThisLevel;
+	size_t pathsInCurrentLevel = pathQueue.size();
+
+	for (size_t i = 0; i < pathsInCurrentLevel; ++i)
 	{
-		return edgeEffects;
-	}
-	for (size_t effectIndex : effectsIterator->second)
-	{
-		if (graph.effects[effectIndex].outputId == toId)
+		QuantityPath currentPath = pathQueue.front();
+		pathQueue.pop();
+
+		int lastId = currentPath.back();
+		const QuantityNode& currentNode = graph.nodes.at(lastId);
+
+		for (const QuantityEdge& edge : currentNode.outgoingEdges)
 		{
-			edgeEffects.push_back(effectIndex);
+			int nextId = edge.targetQuantityId;
+			if (IsQuantityInPath(currentPath, nextId))
+			{
+				continue;
+			}
+
+			QuantityPath nextPath = currentPath;
+			nextPath.push_back(nextId);
+
+			if (nextId == targetId)
+			{
+				foundOnThisLevel.push_back(nextPath);
+			}
+			else
+			{
+				pathQueue.push(nextPath);
+			}
 		}
 	}
-	return edgeEffects;
-}
 
-void FindPaths(
-	const Graph& graph, 
-	int current, 
-	int target, 
-	std::vector<int>& currentPath,
-	std::set<int>& visited, 
-	std::vector<std::vector<int>>& foundPaths
-)
-{
-	if (current == target)
-	{
-		foundPaths.push_back(currentPath);
-		return;
-	}
-	if (currentPath.size() - 1 >= MAX_PATH_LENGTH)
-	{
-		return;
-	}
-
-	for (int next : GetNextQuantities(graph, current))
-	{
-		if (visited.count(next) > 0)
-		{
-			continue;
-		}
-		visited.insert(next);
-		currentPath.push_back(next);
-		FindPaths(graph, next, target, currentPath, visited, foundPaths);
-		currentPath.pop_back();
-		visited.erase(next);
-	}
-}
-
-std::vector<std::vector<int>> SearchPaths(
-	const Graph& graph, 
-	int startId, 
-	int targetId
-)
-{
-	std::vector<std::vector<int>> foundPaths;
-	std::vector<int> currentPath = { startId };
-	std::set<int> visited = { startId };
-	FindPaths(graph, startId, targetId, currentPath, visited, foundPaths);
-	std::stable_sort(foundPaths.begin(), foundPaths.end(),
-		[](const std::vector<int>& left, const std::vector<int>& right)
-		{
-			return left.size() < right.size();
-		});
-	return foundPaths;
-}
-
-std::string JoinStrings(
-	const std::vector<std::string>& items, 
-	const std::string& separator
-)
-{
-	std::string result;
-	for (size_t i = 0; i < items.size(); ++i)
-	{
-		if (i > 0)
-		{
-			result += separator;
-		}
-		result += items[i];
-	}
-	return result;
+	return foundOnThisLevel;
 }
 
 std::vector<int> FindMissingInputs(
-	const PhysicalEffect& effect, 
-	const std::vector<int>& path, 
-	size_t edgeIndex
+	const PhysicalEffect& effect,
+	const QuantityPath& path,
+	size_t stepIndex
 )
 {
 	std::vector<int> missingIds;
-	auto availableEnd = path.begin() + edgeIndex + 1;
+	auto availableEnd = path.begin() + stepIndex + 1;
 	for (int inputId : effect.inputIds)
 	{
 		if (std::find(path.begin(), availableEnd, inputId) == availableEnd)
@@ -436,107 +445,128 @@ std::vector<int> FindMissingInputs(
 }
 
 std::string DescribeEffect(
-	const Graph& graph, 
-	const PhysicalEffect& effect, 
-	const std::vector<int>& missingIds
+	const Graph& graph,
+	const PhysicalEffect& effect,
+	const QuantityPath& path,
+	size_t stepIndex
 )
 {
+	std::vector<int> missingIds = FindMissingInputs(effect, path, stepIndex);
 	if (missingIds.empty())
 	{
-		return effect.name + (effect.inputIds.size() > SINGLE_INPUT_COUNT ? " (все необходимые входные данные доступны)" : "");
+		if (effect.inputIds.size() > 1)
+		{
+			return effect.name + " (все входные величины уже получены в цепочке)";
+		}
+		return effect.name;
 	}
-	std::vector<std::string> missingNames;
+
+	std::vector<std::string> missingDescriptions;
 	for (int missingId : missingIds)
 	{
-		missingNames.push_back(graph.quantityNames.at(missingId));
+		const QuantityNode& node = graph.nodes.at(missingId);
+		missingDescriptions.push_back(std::to_string(node.id) + ": " + node.name);
 	}
-	return effect.name + " (дополнительный обязательный ввод: " + JoinStrings(missingNames, LIST_SEPARATOR) + ")";
+	return effect.name + " (требуется доп. вход: " + JoinStrings(missingDescriptions) + ")";
 }
 
-void WritePath(
-	std::ostream& output, 
-	const Graph& graph, 
-	const std::vector<int>& path, 
-	size_t pathNumber
-)
+void PrintQuantities(const Graph& graph)
 {
-	std::vector<std::string> names;
-	for (int id : path)
+	std::cout << "\nДоступные физические величины:" << std::endl;
+	for (const auto& pair : graph.nodes)
 	{
-		names.push_back(graph.quantityNames.at(id));
-	}
-
-	output << pathNumber << ". Звенья: " << path.size() - 1 << std::endl << std::endl;
-	output << JoinStrings(names, ARROW) << std::endl;
-	for (size_t i = 0; i + 1 < path.size(); ++i)
-	{
-		std::vector<std::string> descriptions;
-		for (size_t effectIndex : FindEdgeEffects(graph, path[i], path[i + 1]))
-		{
-			const PhysicalEffect& effect = graph.effects[effectIndex];
-			descriptions.push_back(DescribeEffect(graph, effect, FindMissingInputs(effect, path, i)));
-		}
-		output << "Шаг " << i + 1 << ": " << JoinStrings(descriptions, LIST_SEPARATOR) << std::endl;
-	}
-	output << std::endl;
-}
-
-void WriteResults(
-	std::ostream& output, 
-	const Graph& graph, 
-	int startId, 
-	int targetId,
-	const std::vector<std::vector<int>>& paths
-)
-{
-	output << std::endl << "Поиск: " << graph.quantityNames.at(startId) << ARROW
-		<< graph.quantityNames.at(targetId) << std::endl;
-	if (paths.empty())
-	{
-		output << "Цепей длиной от " << MIN_PATH_LENGTH << " до " << MAX_PATH_LENGTH
-			<< " не найдено." << std::endl << std::endl;
-		return;
-	}
-	output << "Обнаружено цепей: " << paths.size() << std::endl << std::endl;
-	for (size_t i = 0; i < paths.size(); ++i)
-	{
-		WritePath(output, graph, paths[i], i + 1);
-	}
-}
-
-bool SaveResults(
-	const Graph& graph, 
-	int startId, 
-	int targetId, 
-	const std::vector<std::vector<int>>& paths
-)
-{
-	std::ofstream file(RESULT_FILE_NAME, std::ios::out);
-	if (!file)
-	{
-		std::cerr << "Ошибка: невозможно записать в файл " << RESULT_FILE_NAME << std::endl;
-		return false;
-	}
-	WriteResults(file, graph, startId, targetId, paths);
-	file << "----------------------------------------" << std::endl;
-	return true;
-}
-
-void PrintQuantities(
-	const Graph& graph
-)
-{
-	std::cout << "Доступные физические величины:" << std::endl;
-	for (const auto& quantity : graph.quantityNames)
-	{
-		std::cout << quantity.first << ": " << quantity.second << std::endl;
+		std::cout << pair.first << ": " << pair.second.name << std::endl;
 	}
 	std::cout << std::endl;
 }
 
+void WritePath(
+	std::ostream& output,
+	const Graph& graph,
+	const QuantityPath& path,
+	size_t pathIndex
+)
+{
+	size_t edgeCount = path.size() - 1;
+	output << "  Цепочка #" << pathIndex << " (звеньев: " << edgeCount << "):" << std::endl;
+
+	for (size_t i = 0; i < edgeCount; ++i)
+	{
+		int fromId = path[i];
+		int toId = path[i + 1];
+
+		const QuantityNode& fromNode = graph.nodes.at(fromId);
+		const QuantityNode& toNode = graph.nodes.at(toId);
+		const QuantityEdge* edge = FindOutgoingEdge(fromNode, toId);
+
+		output << "    Шаг " << (i + 1) << ": [" << fromNode.id << ": " << fromNode.name
+			<< "] -> [" << toNode.id << ": " << toNode.name << "]" << std::endl;
+
+		if (edge != nullptr)
+		{
+			std::vector<std::string> effectDescriptions;
+			for (size_t effectIndex : edge->effectIndices)
+			{
+				const PhysicalEffect& effect = graph.effects[effectIndex];
+				effectDescriptions.push_back(DescribeEffect(graph, effect, path, i));
+			}
+
+			output << "      Физические эффекты (" << effectDescriptions.size() << "): "
+				<< JoinStrings(effectDescriptions) << std::endl;
+		}
+	}
+	output << std::endl;
+}
+
+void WriteLengthGroupResults(
+	std::ostream& output,
+	const Graph& graph,
+	size_t chainLength,
+	const std::vector<QuantityPath>& paths,
+	size_t& globalPathCounter
+)
+{
+	output << "--- Цепочки из " << chainLength << " зв. ---" << std::endl;
+	if (paths.empty())
+	{
+		output << "  Цепочек длиной " << chainLength << " зв. не найдено.\n" << std::endl;
+		return;
+	}
+
+	output << "  Найдено цепочек: " << paths.size() << "\n" << std::endl;
+	for (const QuantityPath& path : paths)
+	{
+		++globalPathCounter;
+		WritePath(output, graph, path, globalPathCounter);
+	}
+}
+
+bool AskYesNo(const std::string& prompt)
+{
+	std::string input;
+	while (true)
+	{
+		std::cout << prompt << " (Д/н): ";
+		if (!std::getline(std::cin, input))
+		{
+			return false;
+		}
+		input = Trim(input);
+		if (input == "д" || input == "Д" || input == "y" || input == "Y" || input == "")
+		{
+			return true;
+		}
+		if (input == "н" || input == "Н" || input == "n" || input == "N")
+		{
+			return false;
+		}
+		std::cout << "Пожалуйста, введите 'да' или 'нет'." << std::endl;
+	}
+}
+
 bool ReadQuantityId(
-	const Graph& graph, 
-	const std::string& prompt, 
+	const Graph& graph,
+	const std::string& prompt,
 	int& id
 )
 {
@@ -556,23 +586,78 @@ bool ReadQuantityId(
 	}
 }
 
-bool AskContinue()
-{
-	std::string line;
-	std::cout << "Выполнить еще один поиск? (Д/н): ";
-	if (!std::getline(std::cin, line))
-	{
-		return false;
-	}
-	line = Trim(line);
-	return line.empty() || line == "д" || line == "Д";
-}
-
-void RunSession(
-	const Graph& graph
+void ProcessSingleQuery(
+	const Graph& graph,
+	int startId,
+	int targetId,
+	std::ofstream& resultFile
 )
 {
-	do
+	const QuantityNode& startNode = graph.nodes.at(startId);
+	const QuantityNode& targetNode = graph.nodes.at(targetId);
+
+	std::cout << "\nПоиск: [" << startNode.id << ": " << startNode.name << "] -> ["
+		<< targetNode.id << ": " << targetNode.name << "]\n" << std::endl;
+
+	if (resultFile.is_open())
+	{
+		resultFile << "========================================" << std::endl;
+		resultFile << "Поиск: [" << startNode.id << ": " << startNode.name << "] -> ["
+			<< targetNode.id << ": " << targetNode.name << "]\n" << std::endl;
+	}
+
+	std::queue<QuantityPath> pathQueue;
+	pathQueue.push({ startId });
+
+	size_t globalPathCounter = 0;
+
+	for (size_t length = 1; length <= MAX_CHAIN_LENGTH; ++length)
+	{
+		if (pathQueue.empty())
+		{
+			std::cout << "Дальнейших путей в графе нет (все ветки закончились).\n" << std::endl;
+			break;
+		}
+
+		std::vector<QuantityPath> paths = AdvanceBfsOneLevel(graph, targetId, pathQueue);
+
+		size_t consoleCounter = globalPathCounter;
+		WriteLengthGroupResults(std::cout, graph, length, paths, consoleCounter);
+
+		if (resultFile.is_open())
+		{
+			size_t fileCounter = globalPathCounter;
+			WriteLengthGroupResults(resultFile, graph, length, paths, fileCounter);
+		}
+
+		globalPathCounter = consoleCounter;
+
+		if (length < MAX_CHAIN_LENGTH)
+		{
+			if (pathQueue.empty())
+			{
+				std::cout << "Больше доступных переходов для увеличения длины цепочки нет.\n" << std::endl;
+				break;
+			}
+			if (!AskYesNo("Вывести ещё?"))
+			{
+				break;
+			}
+			std::cout << std::endl;
+		}
+	}
+}
+
+void RunSession(const Graph& graph)
+{
+	std::ofstream resultFile(RESULT_FILE_NAME, std::ios::out);
+	if (!resultFile.is_open())
+	{
+		std::cerr << "Ошибка: невозможно записать в файл " << RESULT_FILE_NAME << std::endl;
+	}
+
+	bool keepSearching = true;
+	while (keepSearching)
 	{
 		PrintQuantities(graph);
 
@@ -586,20 +671,18 @@ void RunSession(
 		{
 			return;
 		}
+
 		if (startId == targetId)
 		{
 			std::cout << "Входные и выходные величины должны различаться." << std::endl;
-			continue;
+		}
+		else
+		{
+			ProcessSingleQuery(graph, startId, targetId, resultFile);
 		}
 
-		std::vector<std::vector<int>> paths = SearchPaths(graph, startId, targetId);
-		WriteResults(std::cout, graph, startId, targetId, paths);
-		if (SaveResults(graph, startId, targetId, paths))
-		{
-			std::cout << "Результат сохранён в " << RESULT_FILE_NAME << std::endl << std::endl;
-		}
+		keepSearching = AskYesNo("Искать ещё?");
 	}
-	while (AskContinue());
 }
 
 int main()
@@ -609,6 +692,7 @@ int main()
 	{
 		return 1;
 	}
+
 	RunSession(graph);
 	return 0;
 }
